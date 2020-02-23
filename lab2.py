@@ -8,7 +8,7 @@ Copyright (c) 2020
 Image Retrieval (from duplicate to categories)
 '''
 
-
+from sklearn.cluster import MiniBatchKMeans
 import numpy as np
 import matplotlib.pyplot as plt
 import cv2
@@ -27,7 +27,7 @@ class imageQuerier:
             self.images = [cv2.resize(cv2.imread(images[i],0), (224, 224), cv2.INTER_LINEAR) for i in tqdm(range(len(images)))]
         else:
             self.images = [imageQuerier.__sift.detectAndCompute(cv2.imread(images[i],0), None)[1] for i in tqdm(range(len(images)))]
-
+    
         self.paths = images
         self.query_image = None 
         self.size = len(images)
@@ -87,7 +87,7 @@ class imageQuerier:
         list_des = list(filter(None.__ne__, self.images))
         self.vocaburary = np.vstack(list_des)
 
-        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0)
+        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 20, 1.0)
         _, label, self.center = cv2.kmeans(self.vocaburary, K, None, criteria, 10, cv2.KMEANS_RANDOM_CENTERS)
 
         cnt = 0
@@ -115,7 +115,7 @@ class imageQuerier:
         
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         _, query_des = self.__sift.detectAndCompute(gray, None)
-
+        print(query_des.shape)
         if not self.BOW_init:
             print("Building Vocaburary!")
             timer.start()
@@ -128,11 +128,12 @@ class imageQuerier:
         for i in des_to_hist:
             hist_query_img[i] += 1
         
-        self.hist_query_img = hist_query_img
+        
         weight = self.__tfidf_weight(hist_query_img, n)
         res = np.dot(hist_query_img * weight , self.vocaburary) 
         rank = np.argsort(res)[::-1]
         self.res = res
+        self.hist_query_img = hist_query_img
         return rank
 
     def plot_query_result(self, top_similar_pic, size = (20, 15)):
@@ -156,6 +157,9 @@ class imageQuerier:
 
     @staticmethod
     def display(img, size = (20, 15)):
+        if img is str:
+            img = cv2.imread(img, 1)
+
         plt.figure(figsize=size)
         plt.axis("off")
         if len(img.shape) == 3:
@@ -208,14 +212,50 @@ if __name__ == "__main__":
     idx2 = random_index(0, len(label_dict[idx]))
     image = cv2.imread(label_dict[idx][idx2], 1)
 
-    top_similar_pic, top_similar_pic_index = iq.query(image)
-    iq.plot_query_result(top_similar_pic)
+    # top_similar_pic, top_similar_pic_index = iq.query(image)
+    # iq.plot_query_result(top_similar_pic)
 
-    rank_path = iq.BOWquery(image)
-    rank_path = iq.BOWquery(image)
     rank_path = iq.BOWquery(image)
 
     imageQuerier.display(image)
     for p in rank_path[:20]:
         imageQuerier.plot(iq.paths[p])
-        
+    
+    p = label_dict[idx][idx2]
+    idx = iq.paths.index(p)
+    des = iq.images[idx]
+
+    his = np.zeros(50)
+    for i in range(len(des)):
+        best, loc = np.linalg.norm(des[i] - iq.center[0]), 0
+        for j in range(len(iq.center)):
+            dist = np.linalg.norm(des[i] - iq.center[j])
+            if dist < best:
+                best = dist
+                loc = j
+        his[loc] += 1
+
+    def descriptor_to_hist(descriptor_vector):
+        return np.argmin(np.linalg.norm(iq.center - descriptor_vector, axis=1))
+    
+    des_to_hist = np.apply_along_axis(descriptor_to_hist, 1, iq.images[idx])
+    hist_query_img = np.zeros(50)
+    for i in des_to_hist:
+        hist_query_img[i] += 1
+
+    print(his)
+    print(iq.vocaburary[:,idx])
+    print(iq.hist_query_img)
+    print(hist_query_img)
+
+
+    # imageQuerier.plot(label_dict[14][1])
+    # idx = iq.paths.index(label_dict[14][1])
+
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    _, query_des = imageQuerier.get_sift().detectAndCompute(gray, None)
+    print(query_des.shape)
+    # des = iq.images[idx]
+    
+
+
