@@ -13,58 +13,35 @@ import numpy as np
 import matplotlib.pyplot as plt
 import cv2
 import os
-
+from tool.timer import timer
+from tqdm import tqdm
+from operator import is_not
+from functools import partial
 
 class imageQuerier:
-    def __init__(self, images):
-        self.images = {i : cv2.resize(cv2.imread(images[i],1), (224, 224)) for i in range(len(images)) }
+    __sift = cv2.xfeatures2d.SIFT_create()
+
+    def __init__(self, images, isDeepLearning = False):
+        print("LOADING IMAGES!")
+        if isDeepLearning:
+            self.images = [cv2.resize(cv2.imread(images[i],0), (224, 224), cv2.INTER_LINEAR) for i in tqdm(range(len(images)))]
+        else:
+            self.images = [imageQuerier.__sift.detectAndCompute(cv2.imread(images[i],0), None)[1] for i in tqdm(range(len(images)))]
+
+        self.paths = images
         self.query_image = None 
         self.size = len(images)
+        self.flag = isDeepLearning
+        self.BOW_init = False
 
-    def display(self, index = 0, size = (20, 15), img = None):
-        if not hasattr(img, "shape"):
-            img = self.images[index]
-        plt.figure(figsize=size)
-        plt.axis("off")
-        if len(img.shape) == 3:
-            plt.imshow(cv2.cvtColor(img, cv2.COLOR_BGR2RGB)) 
-        else:
-            plt.imshow(img,cmap='gray')
-        plt.show()
+    def match(self, index = [0, 1], factor = 0.75):
+        assert(self.flag == False)
+        des1 = self.query_descripor
+        des2 = self.images[index]
 
-    def sift_kp_detect(self, index = 0, size = (20, 15), draw = False):
-        image = self.images[index]
-        gray = cv2.cvtColor(image,cv2.COLOR_BGR2GRAY)
-        # initialize sift key point detector
-        sift = cv2.xfeatures2d.SIFT_create()
-        # detect key points of input image
-        kp = sift.detect(gray,None)
-        if draw:
-            draw_img = cv2.drawKeypoints(gray,kp,image,flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
-            self.display(None, img = draw_img)
-        return kp
-
-    def match(self, index = [0, 1], factor = 0.75, draw = True, query = False):
-        if not query:
-            image_one = self.images[index[0]]
-            image_two = self.images[index[1]]
-        else:
-            image_one = self.query_image
-            image_two = self.images[index]
-            
-        # Initiate SIFT detector
-        gray = cv2.cvtColor(image_one, cv2.COLOR_BGR2GRAY)
-        gray2 = cv2.cvtColor(image_two, cv2.COLOR_BGR2GRAY)
-        sift = cv2.xfeatures2d.SIFT_create()
-        # find the keypoints and descriptors with SIFT
-        kp1, des1 = sift.detectAndCompute(gray, None)
-        kp2, des2 = sift.detectAndCompute(gray2, None)
-        
-        if type(des1) == type(None) or len(des1) <= 2:
-            print("Entered Picture doesnt have enough key point")
-            return 0
         if type(des2) == type(None) or len(des2) <= 2:
             return 0
+
         # FLANN parameters
         FLANN_INDEX_KDTREE = 0
         index_params = dict(algorithm = FLANN_INDEX_KDTREE, trees = 2)
@@ -80,38 +57,83 @@ class imageQuerier:
             if m.distance < factor*n.distance:
                 matchesMask[i]=[1,0]
                 cnt += 1
-        # print(cnt)
-        # dict params for drawing matched picture
-        if draw:
-            draw_params = dict(matchColor = (0,255,0), singlePointColor = (0,0,255), matchesMask = matchesMask, flags = 0)
-            draw_image = cv2.drawMatchesKnn(image_one,kp1,image_two,kp2,matches,None,**draw_params)
-            self.display(img = draw_image)
         return cnt
 
     def query(self, image, factor = 0.75):
+        print("Query(SIFT Matcher Retrieval) Start!")
         self.query_image = image
-        scores = {i:0 for i in range(len(self.images))}
-        for i in range(self.size):
-            score = self.match(index = i, factor = factor, draw = False, query = True)
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        _, self.query_descripor = self.__sift.detectAndCompute(gray, None)
+        
+        if self.query_descripor is None or len(self.query_descripor) <= 2:
+            print("Entered Picture doesnt have enough key points")
+            raise AssertionError
+        
+        timer.start()
+        scores = {i:0 for i in range(self.size)}
+        for i in tqdm(range(self.size)):
+            score = self.match(index = i, factor = factor)
             # print("{}, {}".format(i, score))
             scores[i] = score
         top_similar_pic_index = sorted(scores,  key=scores.get, reverse = True)
 
         total_score = sum([scores[idx] for idx in top_similar_pic_index[:4]])
         top_similar_pic = {idx:scores[idx]/total_score for idx in top_similar_pic_index[:4]}
-        
+        timer.end()
+
         return top_similar_pic, top_similar_pic_index
 
-    def BOWquery(self, image):
+    def __build_vocaburary(self, K):
+        list_des = list(filter(None.__ne__, self.images))
+        self.vocaburary = np.vstack(list_des)
+
+        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0)
+        _, label, self.center = cv2.kmeans(self.vocaburary, K, None, criteria, 10, cv2.KMEANS_RANDOM_CENTERS)
+
+        cnt = 0
+        self.vocaburary = np.zeros((K, self.size))
+        for i in range(self.size):
+            if self.images[i] is None:
+                continue
+            n = self.images[i].shape[0]
+            centered_des = label[cnt:(cnt+n)]
+            for j in centered_des:
+                self.vocaburary[j, i] += 1
+            cnt += n
+
+    def __descriptor_to_hist(self, descriptor_vector):
+        return np.argmin(np.linalg.norm(self.center - descriptor_vector, axis=1))
+
+    def __tfidf_weight(self, hist_query_img, n):
+        tf = hist_query_img / (1+hist_query_img)
+        df = (np.sum(self.vocaburary, 1) + 0.5)/ (np.sum(self.vocaburary)+0.5) 
+        idf = np.log(1/df)
+        return tf * idf
+
+    def BOWquery(self, image, n = 10, K= 50):
         self.query_image = image
-        # Initiate SIFT detector
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        gray2 = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        sift = cv2.xfeatures2d.SIFT_create()
-        # find the keypoints and descriptors with SIFT
-        kp1, des1 = sift.detectAndCompute(gray, None)
-        kp2, des2 = sift.detectAndCompute(gray2, None)
         
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        _, query_des = self.__sift.detectAndCompute(gray, None)
+
+        if not self.BOW_init:
+            print("Building Vocaburary!")
+            timer.start()
+            self.__build_vocaburary(K = K)
+            timer.end()
+            self.BOW_init = True
+        
+        des_to_hist = np.apply_along_axis(self.__descriptor_to_hist, 1, query_des)
+        hist_query_img = np.zeros(K)
+        for i in des_to_hist:
+            hist_query_img[i] += 1
+        
+        self.hist_query_img = hist_query_img
+        weight = self.__tfidf_weight(hist_query_img, n)
+        res = np.dot(hist_query_img * weight , self.vocaburary) 
+        rank = np.argsort(res)[::-1]
+        self.res = res
+        return rank
 
     def plot_query_result(self, top_similar_pic, size = (20, 15)):
         plt.figure(figsize=size)
@@ -123,11 +145,33 @@ class imageQuerier:
         plt.title("Entered Picture")
         for i, idx in enumerate(top_similar_pic):
             plt.subplot(grid[i//2, 2+i%2])
-            img = cv2.cvtColor(self.images[idx], cv2.COLOR_BGR2RGB)
+            if self.flag:
+                img = cv2.cvtColor(self.images[idx], cv2.COLOR_BGR2RGB)
+            else:
+                img = cv2.cvtColor(cv2.imread(self.paths[idx],1 ), cv2.COLOR_BGR2RGB)
             plt.imshow(img)
             plt.title("Top {}, Score {:.2f}".format(i+1, top_similar_pic[idx]))
             plt.axis("off")
         plt.show()
+
+    @staticmethod
+    def display(img, size = (20, 15)):
+        plt.figure(figsize=size)
+        plt.axis("off")
+        if len(img.shape) == 3:
+            plt.imshow(cv2.cvtColor(img, cv2.COLOR_BGR2RGB)) 
+        else:
+            plt.imshow(img,cmap='gray')
+        plt.show()
+
+    @staticmethod
+    def plot(path, size = (20, 15)):
+        img = cv2.imread(path, 1)
+        imageQuerier.display(img, size)
+
+    @classmethod
+    def get_sift(cls):
+        return cls.__sift
 
 def random_index(_min, _max):
     np.random.seed(250)
@@ -159,17 +203,19 @@ if __name__ == "__main__":
     
     # stop => label: 14
     # sample
-    iq = imageQuerier(images_train)
-    idx = random_index(0, len(label_dict[14]))
-    image = cv2.imread(label_dict[14][idx], 1)
-    
-    most_similar, similar_pic_index = iq.query(image)
-    iq.plot_query_result(most_similar)
-    
-    cnt = 0
-    for i, idx in enumerate(similar_pic_index):
-        if labels_train[idx] == 14:
-            cnt += 1
-            if cnt % 50 == 0 or cnt == 1:
-                print("Top {} similar images include {} Stop images, taking {:.4f}%".format(i+1, cnt, cnt/(i+1) * 100))
-            
+    iq = imageQuerier(images_train, isDeepLearning=False)
+    idx = 14
+    idx2 = random_index(0, len(label_dict[idx]))
+    image = cv2.imread(label_dict[idx][idx2], 1)
+
+    top_similar_pic, top_similar_pic_index = iq.query(image)
+    iq.plot_query_result(top_similar_pic)
+
+    rank_path = iq.BOWquery(image)
+    rank_path = iq.BOWquery(image)
+    rank_path = iq.BOWquery(image)
+
+    imageQuerier.display(image)
+    for p in rank_path[:20]:
+        imageQuerier.plot(iq.paths[p])
+        
