@@ -13,29 +13,54 @@ import numpy as np
 import matplotlib.pyplot as plt
 import cv2
 import os
-from tool.timer import timer
+os.environ["CUDA_VISIBLE_DEVICES"]="0"
+
 from tqdm import tqdm
 from operator import is_not
 from functools import partial
+from keras import backend as k
+from keras.models import Sequential, Model
+from keras.layers import Dense, Convolution2D, MaxPool2D, Flatten
+from keras.callbacks import EarlyStopping
+from keras.applications import VGG16
+from sklearn.model_selection import train_test_split
+from keras.applications.vgg16 import preprocess_input
 
 class imageQuerier:
+    """ load the sift_detector as a static member which helps to save time """
     __sift = cv2.xfeatures2d.SIFT_create()
 
-    def __init__(self, images, isDeepLearning = False):
+    def __init__(self, images, labels, isTask3 = False):
+        """
+            @index: images' paths
+            @labels: images' labels
+            @isTask3: it is for task3(using CNN instead of VBoW) or not.
+        """
         print("LOADING IMAGES!")
-        if isDeepLearning:
-            self.images = [cv2.resize(cv2.imread(images[i],0), (224, 224), cv2.INTER_LINEAR) for i in tqdm(range(len(images)))]
+        # if we just want to build a BoW model, we just need the sift descriptors of them, 
+        # and it helps to improve the speed of querying
+        if isTask3:
+            self.images = np.asarray([cv2.resize(cv2.imread(images[i],1), (112, 112), cv2.INTER_LINEAR) for i in tqdm(range(len(images)))])
         else:
-            self.images = [imageQuerier.__sift.detectAndCompute(cv2.imread(images[i],0), None)[1] for i in tqdm(range(len(images)))]
-    
+            self.images = np.asarray([imageQuerier.__sift.detectAndCompute(cv2.imread(images[i],0), None)[1] for i in tqdm(range(len(images)))])
+            # image normalization and change the shape from (224, 224, 3, 30000) to (30000, 224, 224, 3)
+            self.images = preprocess_input(self.image)
+        self.labels = labels
         self.paths = images
         self.query_image = None 
         self.size = len(images)
-        self.flag = isDeepLearning
+        self.isTask3 = isTask3
         self.BOW_init = False
 
-    def match(self, index = [0, 1], factor = 0.75):
-        assert(self.flag == False)
+    def match(self, index, factor = 0.75):
+        """
+            match two pictures by their sift descriptors(the query image and image at index i).
+            
+            @index : if it is used for task 1, it is a list of two pictures' indeces.
+                    Otherwise, it is a intergal (the index of the image will be compared)
+            @factor : the threshold for chosing 'similar' descriptors.
+        """
+        assert(self.isTask3 == False)
         des1 = self.query_descripor
         des2 = self.images[index]
 
@@ -60,6 +85,13 @@ class imageQuerier:
         return cnt
 
     def query(self, image, factor = 0.75):
+        """
+        user interface for image querying(Near Duplicate). 
+        
+        @image : the image will be queried(in our case, it is the image gets 
+                 geographical transformation)
+        @factor : a hyperparameter for chosing 'similar' descriptors.
+      """
         print("Query(SIFT Matcher Retrieval) Start!")
         self.query_image = image
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
@@ -68,98 +100,223 @@ class imageQuerier:
         if self.query_descripor is None or len(self.query_descripor) <= 2:
             print("Entered Picture doesnt have enough key points")
             raise AssertionError
-        
-        timer.start()
+
+        """ 
+          match every image in the image set, and compute their similarity score
+          based on the numbers of 'similar' descriptors
+        """
         scores = {i:0 for i in range(self.size)}
         for i in tqdm(range(self.size)):
             score = self.match(index = i, factor = factor)
-            # print("{}, {}".format(i, score))
             scores[i] = score
+
+        # This output is just for ploting results.
         top_similar_pic_index = sorted(scores,  key=scores.get, reverse = True)
+        return {idx:scores[idx]/max(scores.values()) for idx in top_similar_pic_index[:12]}
+    
 
-        total_score = sum([scores[idx] for idx in top_similar_pic_index[:4]])
-        top_similar_pic = {idx:scores[idx]/total_score for idx in top_similar_pic_index[:4]}
-        timer.end()
+    def BOWquery(self, image, N= 50):
+        """
+            it is a user interface for using tf-idf weighted BoW querying model. 
+        
+            @image : the image will be queried
+            @factor : a theshold for chosing 'similar' descriptors.
+        """
+        
+        self.query_image = image
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        _, query_des = self.__sift.detectAndCompute(gray, None)
+        
+        if not self.BOW_init:
+            print("Building Vocaburary!")
+            self.__build_vocaburary(N)
+            self.BOW_init = True
+            
+        # convert to hist representation
+        des_to_hist = self.kmeans.predict(query_des)
+        hist_query_img = np.zeros(N)
+        for i in des_to_hist:
+            hist_query_img[i] += 1
 
-        return top_similar_pic, top_similar_pic_index
+        # Compute the similarity, and return top 12 similar images
 
-    def __build_vocaburary(self, K):
+        """ 
+            this lambda function `cos_sim` to compute the consine similarity of two vectors for using 
+            numpy.apply_along_axis(faster than `for` loop). add a small number to make sure denominator 
+            is not equal to 0
+        """
+        cos_sim = lambda a,b : np.dot(a, b)/(np.linalg.norm(a)*np.linalg.norm(b) + 0.001) 
+
+        similarity = np.apply_along_axis(partial(cos_sim, hist_query_img), 0, self.weight_voc)
+        similarity = np.nan_to_num(similarity)
+        rank_12_index = similarity.argsort()[-12:][::-1]
+        return {i : similarity[i] for i in rank_12_index}
+
+    def __build_vocaburary(self, N):
+        """
+            Build tf-idf weighted vocaburary/codebook using K-means algorithm
+
+            @N : the number of clusters in kmeans
+        """
+
+        # drop the images which dont have descriptors(None filter)
         list_des = list(filter(None.__ne__, self.images))
-        self.vocaburary = np.vstack(list_des)
+        descriptors_list = np.vstack(list_des)
+        self.N = N
+        self.kmeans = MiniBatchKMeans(n_clusters=N, random_state=0, batch_size=64)
+        self.kmeans.fit(descriptors_list)
+        cluster_of_each_descriptor = self.kmeans.predict(descriptors_list)
 
-        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 20, 1.0)
-        _, label, self.center = cv2.kmeans(self.vocaburary, K, None, criteria, 10, cv2.KMEANS_RANDOM_CENTERS)
-
-        cnt = 0
-        self.vocaburary = np.zeros((K, self.size))
+        """
+            images can have different numbers of keypoints, I use a counter(cnt) here 
+            to make sure the descriptors can find its recorresponding image
+        """
+        cnt = 0 
+        vocaburary = np.zeros((N, self.size))
         for i in range(self.size):
+            # some images doesnt have descriptors(for task2 we load descriptors instead of image),
+            # so self.images here is actually images' descriptors
             if self.images[i] is None:
                 continue
             n = self.images[i].shape[0]
-            centered_des = label[cnt:(cnt+n)]
+            centered_des = cluster_of_each_descriptor[cnt:(cnt+n)]
             for j in centered_des:
-                self.vocaburary[j, i] += 1
+                vocaburary[j, i] += 1
             cnt += n
 
-    def __descriptor_to_hist(self, descriptor_vector):
-        return np.argmin(np.linalg.norm(self.center - descriptor_vector, axis=1))
+        # TF-IDF weight
+        tf = vocaburary/(np.sum(vocaburary, 0)+0.1)
+        idf = np.log(self.size / np.sum(vocaburary, 1))
+        tf_idf = np.multiply(tf, idf.reshape(-1,1))
+        self.weight_voc = np.multiply(vocaburary, tf_idf) # tf-idf weighted
+    
+    # def __descriptor_to_hist(self, descriptor_vector):
+    #     return np.argmin(np.linalg.norm(self.center - descriptor_vector, axis=1))
 
-    def __tfidf_weight(self, hist_query_img, n):
-        tf = hist_query_img / (1+hist_query_img)
-        df = (np.sum(self.vocaburary, 1) + 0.5)/ (np.sum(self.vocaburary)+0.5) 
-        idf = np.log(1/df)
-        return tf * idf
+    # def __tfidf_weight(self, hist_query_img, n):
+    #     tf = hist_query_img / (1+hist_query_img)
+    #     df = (np.sum(self.vocaburary, 1) + 0.5)/ (np.sum(self.vocaburary)+0.5) 
+    #     idf = np.log(1/df)
+    #     return tf * idf
 
-    def BOWquery(self, image, n = 10, K= 50):
-        self.query_image = image
+    def build_classifier(self, fit_params):
+        if self.isTask3:
+            # Task 3:Using CNN to retrieve images
+            self.model = VGG16(weights='imagenet', include_top=False, input_shape=(112, 112, 3))
+
+            # Freeze the required layers
+            for layer in self.model.layers[:-4]:
+                layer.trainable = False
+
+            """
+              Add two fully connected layers and a softmax layer 
+              function `.add` doesn't work in my version. solution I use is the link below
+              https://github.com/keras-team/keras/issues/4040
+            """
+            last = self.model.output
+            last = Flatten()(last)
+            # add two dense layers and softmax layers
+            last = Dense(2048, activation='relu')(last)
+            last = Dense(1024, activation='relu')(last)
+            preds = Dense(43, activation='softmax')(last)
+            self.model = Model(self.model.input, preds)
+        else:
+            # for last step of task2 : Train a neural network to classify several categories
+            self.model = Sequential([Dense(258, input_dim=self.N, activation="relu"),
+                                Dense(128, activation="relu"),
+                                Dense(128, activation="relu"),
+                                Dense(43, activation="softmax")])
+        self.__train(fit_params)
+
+    def __train(self, fit_params):
+        self.model.compile(loss='sparse_categorical_crossentropy', optimizer='adam', 
+                           metrics=['accuracy'])
         
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        _, query_des = self.__sift.detectAndCompute(gray, None)
-        print(query_des.shape)
-        if not self.BOW_init:
-            print("Building Vocaburary!")
-            timer.start()
-            self.__build_vocaburary(K = K)
-            timer.end()
-            self.BOW_init = True
+        """
+            Split data into trainning and validation set with shuffling. Keras's `shuffle paramater` doen't shuffle 
+            the order of validation set(our images data are in the order of the labels' name).
+            https://stackoverflow.com/questions/52439468/keras-how-to-take-random-samples-for-validation-set
+        """
+        if self.isTask3:
+            XTraining, XValidation, YTraining, YValidation = train_test_split(self.images, self.labels, shuffle = True,
+                                                             stratify=self.labels,test_size=0.1, random_state=0) 
+        else:
+            XTraining, XValidation, YTraining, YValidation = train_test_split(self.weight_voc.T, self.labels, shuffle = True,
+                                                             stratify=self.labels, test_size=0.1, random_state=0) 
+        early_stopping = EarlyStopping(monitor='val_loss',patience=10)
+        history = self.model.fit(XTraining,YTraining, validation_data=(XValidation,YValidation),callbacks=[early_stopping], **fit_params)
         
-        des_to_hist = np.apply_along_axis(self.__descriptor_to_hist, 1, query_des)
-        hist_query_img = np.zeros(K)
-        for i in des_to_hist:
-            hist_query_img[i] += 1
-        
-        
-        weight = self.__tfidf_weight(hist_query_img, n)
-        res = np.dot(hist_query_img * weight , self.vocaburary) 
-        rank = np.argsort(res)[::-1]
-        self.res = res
-        self.hist_query_img = hist_query_img
-        return rank
+        # Plot training result
+        plt.figure(figsize = (20,16))
+        grid = plt.GridSpec(1, 2)
+        plt.subplot(grid[0,0])
+        plt.plot(history.history['accuracy'])
+        plt.plot(history.history['val_accuracy'])
+        plt.title('Model Accuracy')
+        plt.ylabel('Accuracy')
+        plt.xlabel('Epoch')
+        plt.legend(['Train', 'Test'], loc='upper left')
+
+        plt.subplot(grid[0,1])
+        plt.plot(history.history['loss'])
+        plt.plot(history.history['val_loss'])
+        plt.title('Model Loss')
+        plt.ylabel('Loss')
+        plt.xlabel('Epoch')
+        plt.legend(['Train', 'Test'], loc='upper left')
+        plt.show()
 
     def plot_query_result(self, top_similar_pic, size = (20, 15)):
-        plt.figure(figsize=size)
+        """
+        It is a function helps to plot the querying result. 
         
+        @top_similar_pic : it is a dictionary. Its key is image indexes, and
+                           its value is the similarity score of that image.
+        @size : the size of image will be displayed 
+        """
+        plt.figure(figsize=size)
         grid = plt.GridSpec(2, 4)
         plt.subplot(grid[:2, :2])
         plt.imshow(cv2.cvtColor(self.query_image, cv2.COLOR_BGR2RGB))
         plt.axis("off")
         plt.title("Entered Picture")
-        for i, idx in enumerate(top_similar_pic):
+
+        keys = list(top_similar_pic.keys())
+        for i, idx in enumerate(keys[:4]):
             plt.subplot(grid[i//2, 2+i%2])
-            if self.flag:
+            if self.isTask3:
                 img = cv2.cvtColor(self.images[idx], cv2.COLOR_BGR2RGB)
             else:
                 img = cv2.cvtColor(cv2.imread(self.paths[idx],1 ), cv2.COLOR_BGR2RGB)
             plt.imshow(img)
-            plt.title("Top {}, Score {:.2f}".format(i+1, top_similar_pic[idx]))
+            plt.title("Top {}, Score {:.2f}".format(i+5, top_similar_pic[idx]))
+            plt.axis("off")
+        plt.show()
+
+        plt.figure(figsize=size)
+        grid = plt.GridSpec(2, 4)
+        for i, idx in enumerate(keys[4:]):
+            plt.subplot(grid[i//4, i%4])
+            if self.isTask3:
+                img = cv2.cvtColor(self.images[idx], cv2.COLOR_BGR2RGB)
+            else:
+                img = cv2.cvtColor(cv2.imread(self.paths[idx],1 ), cv2.COLOR_BGR2RGB)
+            plt.imshow(img)
+            plt.title("Top {}, Score {:.2f}".format(i+5, top_similar_pic[idx]))
             plt.axis("off")
         plt.show()
 
     @staticmethod
     def display(img, size = (20, 15)):
-        if img is str:
-            img = cv2.imread(img, 1)
+        """
+            A function used to plot an image. If `img` is a string, it supposes to be the path.
+            Otherwise, it's a BGR/gray image
 
+            @image : the image will be displayed 
+            @size : the size of image will be displayed 
+        """
+        if isinstance(img, str) :
+            img = cv2.imread(img, 1)
         plt.figure(figsize=size)
         plt.axis("off")
         if len(img.shape) == 3:
@@ -170,18 +327,29 @@ class imageQuerier:
 
     @staticmethod
     def plot(path, size = (20, 15)):
+        """For debugging"""
         img = cv2.imread(path, 1)
         imageQuerier.display(img, size)
 
     @classmethod
     def get_sift(cls):
+        """
+          Get sift detector. It is just for debugging
+        """
         return cls.__sift
 
 def random_index(_min, _max):
+    """
+      Get a random number between _min and _max
+    """
     np.random.seed(250)
     return np.random.randint(_min, _max)
 
 def load_data(data_directory):
+    """
+      Loading the traffic sign data from local path
+      @data_directory: the path of traffic sign data
+    """
     directories = [d for d in os.listdir(data_directory) 
                    if os.path.isdir(os.path.join(data_directory, d))]
     labels = []
@@ -198,64 +366,50 @@ def load_data(data_directory):
             _dict[label].append(filename)
     return images, labels, _dict
 
+def generate_random_image(label_dict):
+    # get a random picture whitin STOP label
+    label_idx = 14 # index of STOP
+    image_idx = random_index(0, len(label_dict[label_idx]))
+    return cv2.imread(label_dict[label_idx][image_idx], 1)
+
 if __name__ == "__main__":
     ROOT_PATH = "data"
     train_data_directory = os.path.join(ROOT_PATH, "TrafficSigns/Train")
+    
+    N = 50 # the number of clusters in kmeans
 
-    # load data
+    # load images and labels
     images_train, labels_train, label_dict = load_data(train_data_directory)
     
-    # stop => label: 14
-    # sample
-    iq = imageQuerier(images_train, isDeepLearning=False)
-    idx = 14
-    idx2 = random_index(0, len(label_dict[idx]))
-    image = cv2.imread(label_dict[idx][idx2], 1)
+    # Task1: near duplicate query
+    image = generate_random_image(label_dict)
+    iq = imageQuerier(images_train, np.array(labels_train), isTask3=False)
 
-    # top_similar_pic, top_similar_pic_index = iq.query(image)
-    # iq.plot_query_result(top_similar_pic)
+    ## get top 12 most similar images in the whole dataset
+    top_similar = iq.query(image)
+    iq.plot_query_result(top_similar)
 
-    rank_path = iq.BOWquery(image)
 
-    imageQuerier.display(image)
-    for p in rank_path[:20]:
-        imageQuerier.plot(iq.paths[p])
+
+    # Task2: Using Bag-of-Word model to represent Images
+    rank_12_sim = iq.BOWquery(image, N)
+
+    # I also try to use cosine similarity of weighted BoW to query an image
+    # It also works well 
+    iq.plot_query_result(rank_12_sim)
+
+    # Train a neural network for weighted BoW
+    fit_params = {
+        "batch_size": 128,
+        "epochs": 100,
+        "shuffle":True,
+        # "verbose":0
+        # "validation_split": 0.15
+    }
+
+    # iq.build_classifier(fit_params)
+
+    # Task3: Using Convolutional Neural Network to represent Images
+    iq2 = imageQuerier(images_train, np.array(labels_train), isTask3=True)
+    iq2.build_classifier(fit_params)
     
-    p = label_dict[idx][idx2]
-    idx = iq.paths.index(p)
-    des = iq.images[idx]
-
-    his = np.zeros(50)
-    for i in range(len(des)):
-        best, loc = np.linalg.norm(des[i] - iq.center[0]), 0
-        for j in range(len(iq.center)):
-            dist = np.linalg.norm(des[i] - iq.center[j])
-            if dist < best:
-                best = dist
-                loc = j
-        his[loc] += 1
-
-    def descriptor_to_hist(descriptor_vector):
-        return np.argmin(np.linalg.norm(iq.center - descriptor_vector, axis=1))
-    
-    des_to_hist = np.apply_along_axis(descriptor_to_hist, 1, iq.images[idx])
-    hist_query_img = np.zeros(50)
-    for i in des_to_hist:
-        hist_query_img[i] += 1
-
-    print(his)
-    print(iq.vocaburary[:,idx])
-    print(iq.hist_query_img)
-    print(hist_query_img)
-
-
-    # imageQuerier.plot(label_dict[14][1])
-    # idx = iq.paths.index(label_dict[14][1])
-
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    _, query_des = imageQuerier.get_sift().detectAndCompute(gray, None)
-    print(query_des.shape)
-    # des = iq.images[idx]
-    
-
-
