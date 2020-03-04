@@ -1,6 +1,7 @@
 
 LAB2 by Lin Sinan
 
+Lab1 : https://colab.research.google.com/drive/1RcG231WCd6emM71wgF84Eqcz2Ds78chV
 
 ```python
 from sklearn.cluster import MiniBatchKMeans
