@@ -41,10 +41,10 @@ class imageQuerier:
         # and it helps to improve the speed of querying
         if isTask3:
             self.images = np.asarray([cv2.resize(cv2.imread(images[i],1), (112, 112), cv2.INTER_LINEAR) for i in tqdm(range(len(images)))])
+            self.images = preprocess_input(self.images) # image normalization and change the shape from (224, 224, 3, 30000) to (30000, 224, 224, 3)
         else:
             self.images = np.asarray([imageQuerier.__sift.detectAndCompute(cv2.imread(images[i],0), None)[1] for i in tqdm(range(len(images)))])
-            # image normalization and change the shape from (224, 224, 3, 30000) to (30000, 224, 224, 3)
-            self.images = preprocess_input(self.image)
+            
         self.labels = labels
         self.paths = images
         self.query_image = None 
@@ -389,8 +389,7 @@ if __name__ == "__main__":
     top_similar = iq.query(image)
     iq.plot_query_result(top_similar)
 
-
-
+    
     # Task2: Using Bag-of-Word model to represent Images
     rank_12_sim = iq.BOWquery(image, N)
 
@@ -406,8 +405,7 @@ if __name__ == "__main__":
         # "verbose":0
         # "validation_split": 0.15
     }
-
-    # iq.build_classifier(fit_params)
+    iq.build_classifier(fit_params)
 
     # Task3: Using Convolutional Neural Network to represent Images
     iq2 = imageQuerier(images_train, np.array(labels_train), isTask3=True)
