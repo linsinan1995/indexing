@@ -250,8 +250,8 @@ class imageQuerier:
         plt.figure(figsize = (20,16))
         grid = plt.GridSpec(1, 2)
         plt.subplot(grid[0,0])
-        plt.plot(history.history['accuracy'])
-        plt.plot(history.history['val_accuracy'])
+        plt.plot(history.history['acc'])
+        plt.plot(history.history['val_acc'])
         plt.title('Model Accuracy')
         plt.ylabel('Accuracy')
         plt.xlabel('Epoch')
@@ -398,13 +398,16 @@ if __name__ == "__main__":
     iq.plot_query_result(rank_12_sim)
 
     # Train a neural network for weighted BoW
+    # Train a neural network for weighted BoW
     fit_params = {
         "batch_size": 128,
         "epochs": 100,
         "shuffle":True,
-        # "verbose":0
-        # "validation_split": 0.15
+        "verbose":0,
+        "validation_split": 0.15,
+        "callbacks":[EarlyStopping(monitor='val_acc',patience=10)]
     }
+    
     iq.build_classifier(fit_params)
 
     # Task3: Using Convolutional Neural Network to represent Images
